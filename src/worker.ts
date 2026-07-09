@@ -1,15 +1,26 @@
-// Cloudflare Worker entry point backing the app's server-side API.
-// Currently a stub that answers every request with 404 — this is the
-// seam where the agent's chat/tool endpoints will be added.
+// Worker entrypoint: wires the DesignAgent Durable Object into Cloudflare's
+// Workers runtime and delegates all agent routing (WebSocket upgrades,
+// per-conversation instance lookup) to the `agents` framework.
+
+import { DesignAgent } from "./agent";
+import { routeAgentRequest } from "agents";
+
+// Re-export so wrangler can bind the class as a Durable Object namespace
+// (see the DesignAgent binding in wrangler config).
+export { DesignAgent };
+
+interface Env {
+  DesignAgent: DurableObjectNamespace;
+  OPENAI_API_KEY: string;
+}
 
 export default {
-  // Request handler invoked by the Workers runtime for every incoming
-  // request. Both params are unused for now since there are no routes yet.
-  fetch(_request: Request, _env: Env) {
-    return new Response("Not found", { status: 404 });
+  async fetch(request: Request, env: Env) {
+    // routeAgentRequest matches /agents/:agent/:name style paths and
+    // forwards to the right Durable Object instance; anything else 404s.
+    return (
+      (await routeAgentRequest(request, env)) ||
+      new Response("Not found", { status: 404 })
+    );
   },
 } satisfies ExportedHandler<Env>;
-
-// Worker environment bindings (KV, D1, secrets, etc.), empty until routes
-// and integrations that need them are introduced.
-interface Env {}
