@@ -6,5 +6,6 @@ dist
 openspec
 .claude
 notes
+evals/results
 
 CLAUDE.md

@@ -1,20 +1,15 @@
-// Top-level app shell: wires the Excalidraw canvas up to the chat agent.
-// Listens for tool-call output in the chat stream (generateDiagram /
-// modifyDiagram) and translates it into imperative Excalidraw scene updates.
+// Main chat + canvas screen. Wires the Cloudflare Agent connection
+// (useAgent/useAgentChat) to an Excalidraw canvas: whenever the agent's
+// generateDiagram or modifyDiagram tools produce output, this component
+// converts that output into real Excalidraw elements and paints the canvas.
 
-// React state/effect hooks plus Excalidraw's imperative API type
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
-// Excalidraw helpers: build full elements from agent-provided skeletons,
-// merge partial updates into an existing element, and control when scene
-// changes get committed to undo/redo history.
 import {
   convertToExcalidrawElements,
   CaptureUpdateAction,
   newElementWith,
 } from "@excalidraw/excalidraw";
-// Cloudflare Agents SDK: connects to the durable object instance and
-// layers the chat protocol (messages, sendMessage, status) on top.
 import { useAgent } from "agents/react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import Canvas from "./components/Canvas";
@@ -28,8 +23,6 @@ import "./App.css";
 const sessionId = crypto.randomUUID();
 
 export default function App() {
-  // Excalidraw only exposes its imperative API once mounted, so it starts
-  // null and is filled in via the onApiReady callback below.
   const [excalidrawAPI, setExcalidrawAPI] =
     useState<ExcalidrawImperativeAPI | null>(null);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -113,9 +106,8 @@ export default function App() {
     }
   }, [messages, excalidrawAPI]);
 
-  // Layout: canvas fills the main area, chat panel docks alongside it.
-  // Theme is driven by Canvas (it reads Excalidraw's own light/dark toggle)
-  // and applied here as a class so the rest of the app can react to it.
+  // Canvas on the left, chat panel on the right, plus a small hidden-ish
+  // link to the standalone diagram viewer used for eval scoring.
   return (
     <div className={`app ${theme}`}>
       <div className="canvas-container">
@@ -126,6 +118,9 @@ export default function App() {
         sendMessage={sendMessage}
         status={status}
       />
+      <a href="#viewer" className="viewer-launch" title="Open diagram viewer for human scoring">
+        viewer
+      </a>
     </div>
   );
 }
