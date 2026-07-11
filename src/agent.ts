@@ -1,43 +1,32 @@
-// Cloudflare Agents SDK entry point for the diagramming assistant. This class
-// is instantiated as a Durable Object per session (one per browser tab, keyed
-// by the sessionId App.tsx generates) and handles the actual LLM turn.
+// Cloudflare Worker entry point for the live chat experience: a Durable
+// Object-backed chat agent that streams responses back to the client.
+// The actual model/tool/prompt logic all lives in agent-core so this file
+// stays a thin adapter between the Cloudflare runtime and shared agent code.
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
-import {
-  streamText,
-  convertToModelMessages,
-  stepCountIs,
-} from "ai";
+import { convertToModelMessages } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
-import { tools } from "./tools";
-import { SYSTEM_PROMPT } from "./system-prompt";
+import { streamAgent } from "./agent-core";
 
-// Worker bindings this agent needs, layered on top of the generated
-// Cloudflare.Env type (wrangler types) for the OpenAI key from .dev.vars/secrets.
+// Worker bindings/secrets, layered on top of the Cloudflare defaults.
 interface Env extends Cloudflare.Env {
   OPENAI_API_KEY: string;
 }
 
-// AIChatAgent gives us message persistence + the chat wire protocol for free;
-// we only need to fill in what a single incoming message does.
+// One Durable Object instance per chat session; AIChatAgent persists
+// message history for us and hands it back via this.messages.
 export class DesignAgent extends AIChatAgent<Env> {
-  // Called by the SDK whenever the client sends a new chat message. Runs the
-  // model with the diagram tools available and streams the response back
-  // over the same connection useAgentChat is listening on.
+  // Invoked on every new chat message. No seed canvasState is passed here
+  // since the browser owns the real canvas mutation client-side.
   async onChatMessage() {
     const openai = createOpenAI({ apiKey: this.env.OPENAI_API_KEY });
 
-    const result = streamText({
+    const result = streamAgent({
       model: openai("gpt-5.4-mini"),
-      system: SYSTEM_PROMPT,
-      // this.messages is the full persisted history for this agent instance;
-      // convertToModelMessages adapts the UI message shape to what the model expects.
       messages: await convertToModelMessages(this.messages),
-      tools,
-      // Cap tool-call loops at 5 steps so a confused model can't spin forever.
-      stopWhen: stepCountIs(5),
     });
 
+    // Stream tokens/tool calls back to the client as they arrive.
     return result.toUIMessageStreamResponse();
   }
 }
