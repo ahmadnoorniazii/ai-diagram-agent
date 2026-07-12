@@ -1,9 +1,8 @@
-// Main chat + canvas screen. Wires the Cloudflare Agent connection
-// (useAgent/useAgentChat) to an Excalidraw canvas: whenever the agent's
-// generateDiagram or modifyDiagram tools produce output, this component
-// converts that output into real Excalidraw elements and paints the canvas.
-
-import { useState, useCallback, useEffect, useRef } from "react";
+// Top-level app: wires the Excalidraw canvas to the Cloudflare Agent chat
+// connection, forwards canvas snapshots out with every user message, and
+// applies the agent's generateDiagram / modifyDiagram tool outputs back onto
+// the canvas as they stream in.
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 import {
   convertToExcalidrawElements,
@@ -31,6 +30,7 @@ export default function App() {
   // don't apply the same elements twice as messages re-render.
   const appliedToolCalls = useRef<Set<string>>(new Set());
 
+  // Handed to Canvas as a ref callback once Excalidraw has mounted.
   const handleApiReady = useCallback((api: ExcalidrawImperativeAPI) => {
     setExcalidrawAPI(api);
   }, []);
@@ -41,6 +41,27 @@ export default function App() {
   // useAgentChat manages the chat protocol on top of the agent connection.
   // It gives us the messages array, a sendMessage function, and a status.
   const { messages, sendMessage, status } = useAgentChat({ agent });
+
+  // Wrap sendMessage so every outgoing user message also carries a snapshot
+  // of the current canvas state in a data-canvas-state part. The worker
+  // reads this off the latest user message and serializes it into the
+  // system prompt. This is the transport for canvas awareness; it will
+  // later be replaced with a client side tool the agent can
+  // call directly when it actually needs the info.
+  const sendWithCanvas = useMemo(
+    () =>
+      (msg: { role: "user"; parts: { type: "text"; text: string }[] }) => {
+        const elements = excalidrawAPI?.getSceneElements() ?? [];
+        sendMessage({
+          ...msg,
+          parts: [
+            ...msg.parts,
+            { type: "data-canvas-state", data: { elements } } as never,
+          ],
+        });
+      },
+    [sendMessage, excalidrawAPI]
+  );
 
   // Watch messages for tool outputs and apply them to the canvas. We handle
   // both tools the agent has: generateDiagram (replace canvas) and
@@ -64,6 +85,8 @@ export default function App() {
           appliedToolCalls.current.add(part.toolCallId);
           const output = part.output as { elements?: unknown };
           const skeletonElements = output?.elements;
+          // Full replace of the scene — generateDiagram is used for
+          // brand-new diagrams or a from-scratch redo, not incremental edits.
           if (Array.isArray(skeletonElements) && skeletonElements.length > 0) {
             // The agent returns simplified element shapes. Excalidraw needs
             // full element data (seed, versionNonce, etc.) which this helper
@@ -106,8 +129,8 @@ export default function App() {
     }
   }, [messages, excalidrawAPI]);
 
-  // Canvas on the left, chat panel on the right, plus a small hidden-ish
-  // link to the standalone diagram viewer used for eval scoring.
+  // Canvas + chat side by side; theme class flows down from Canvas's own
+  // light/dark detection so the surrounding chrome matches the drawing area.
   return (
     <div className={`app ${theme}`}>
       <div className="canvas-container">
@@ -115,9 +138,10 @@ export default function App() {
       </div>
       <ChatPanel
         messages={messages}
-        sendMessage={sendMessage}
+        sendMessage={sendWithCanvas}
         status={status}
       />
+      {/* Static link to the separate results viewer route, not part of the SPA router */}
       <a href="#viewer" className="viewer-launch" title="Open diagram viewer for human scoring">
         viewer
       </a>

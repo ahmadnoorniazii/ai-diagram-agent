@@ -7,11 +7,11 @@
 // The whole point is the agent should not be able to tell the difference
 // between this fake history and a real session it lived through.
 
-// Only need the message shape the AI SDK expects; no runtime import from "ai".
 import type { ModelMessage } from "ai";
 
-// Optional fake prior turn used to simulate a canvas that already has
-// elements on it before the "modify" prompt comes in.
+// Shape of the "prior state" a modify-style golden case seeds the canvas
+// with. Currently unused by buildMessages itself (canvasState carries the
+// seed now) but kept as the type golden.json's `seed` field is checked against.
 export interface SeedData {
   userPrompt: string;
   assistantConfirmation: string;
@@ -21,7 +21,8 @@ export interface SeedData {
 export type Difficulty = "simple" | "medium" | "hard" | "edge";
 export type Category = "create" | "modify" | "domain" | "edge";
 
-// Shape of a single row in the golden dataset (evals/datasets/golden.json).
+// One row of the golden dataset: an input prompt plus the criteria a human
+// (or future auto-scorer) checks the agent's output against.
 export interface GoldenTestCase {
   id: string;
   input: string;
@@ -33,44 +34,11 @@ export interface GoldenTestCase {
   category: Category;
 }
 
+// Always returns a single user turn. The seed elements (if any) are passed
+// separately as `canvasState` to runAgent — that's how the agent learns
+// what's already on the canvas. We used to mock a fake tool
+// history here, but that workaround is gone now that canvas state is a
+// first class arg to the agent core.
 export function buildMessages(tc: GoldenTestCase): ModelMessage[] {
-  // Create cases: just the single user turn, nothing to fake.
-  if (!tc.seed) {
-    return [{ role: "user", content: tc.input }];
-  }
-
-  // Modify cases: reconstruct a full round trip (user ask -> tool call ->
-  // tool result -> assistant confirmation) so the model sees a believable
-  // prior turn before the actual modify request.
-  const callId = `seed_${tc.id}`;
-  return [
-    { role: "user", content: tc.seed.userPrompt },
-    {
-      role: "assistant",
-      content: [
-        {
-          type: "tool-call",
-          toolCallId: callId,
-          toolName: "generateDiagram",
-          input: { elements: tc.seed.elements },
-        },
-      ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId: callId,
-          toolName: "generateDiagram",
-          output: {
-            type: "json",
-            value: { elements: tc.seed.elements as never },
-          },
-        },
-      ],
-    },
-    { role: "assistant", content: tc.seed.assistantConfirmation },
-    { role: "user", content: tc.input },
-  ];
+  return [{ role: "user", content: tc.input }];
 }
