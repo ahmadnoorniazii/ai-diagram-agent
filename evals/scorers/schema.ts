@@ -9,20 +9,22 @@
 import type { EvalScorer } from "braintrust";
 import type { GoldenTestCase } from "../buildMessages";
 
-// Minimum fields every Excalidraw element needs to render without crashing.
+// Minimum viable Excalidraw element: every element needs these fields
+// regardless of type, and its type must be one Excalidraw actually renders.
 const REQUIRED_FIELDS = ["id", "type", "x", "y", "width", "height"] as const;
 const VALID_TYPES = ["rectangle", "ellipse", "diamond", "text", "arrow", "line"];
 
-// Shape the eval task returns; also consumed by the other scorers.
+// Shape returned by both runAgent (production path) and the eval task
+// wrapper; the scorers below all consume this.
 export interface AgentOutput {
   text: string;
   elements: unknown[];
+  toolCalls: string[];
 }
 
 export const schemaScorer: EvalScorer<GoldenTestCase, AgentOutput, GoldenTestCase> = ({
   output,
 }) => {
-  // Bail out early on the coarse failure modes: wrong shape or nothing at all.
   if (!Array.isArray(output.elements)) {
     return { name: "Schema", score: 0, metadata: { reason: "elements is not an array" } };
   }
@@ -31,7 +33,9 @@ export const schemaScorer: EvalScorer<GoldenTestCase, AgentOutput, GoldenTestCas
     return { name: "Schema", score: 0, metadata: { reason: "no elements produced" } };
   }
 
-  // All-or-nothing pass: the first invalid element fails the whole case.
+  // Fail fast on the first invalid element rather than collecting every
+  // violation — for this pass/fail scorer, one bad element is enough to
+  // break the canvas.
   for (const element of output.elements) {
     if (!element || typeof element !== "object") {
       return { name: "Schema", score: 0, metadata: { reason: "element is not an object" } };

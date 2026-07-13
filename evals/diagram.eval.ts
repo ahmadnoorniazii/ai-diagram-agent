@@ -7,37 +7,38 @@
 // Run with:
 //   npm run eval
 
-// Node/env plumbing to read the dataset file and load OPENAI_API_KEY.
+// Node/env plumbing for loading the dataset and secrets, Braintrust's Eval
+// entrypoint, and the model client, followed by the shared agent runner and
+// the scorers wired into this run.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "dotenv";
 import { Eval } from "braintrust";
 import { createOpenAI } from "@ai-sdk/openai";
 
-// Reuse the exact same agent code path the worker uses, so the eval measures
-// the real thing rather than a reimplementation.
 import { runAgent } from "../src/agent-core";
 import { buildMessages, type GoldenTestCase } from "./buildMessages";
 import { schemaScorer, type AgentOutput } from "./scorers/schema";
 import { structureScorer } from "./scorers/structure";
-import { preservationScorer } from "./scorers/preservation";
+import { toolChoiceScorer } from "./scorers/toolChoice";
 import { labelKeywordScorer } from "./scorers/labelKeyword";
+// boundArrowsScorer, boundLabelsScorer, connectivityScorer ship in
+// evals/scorers/ but are deliberately not wired here. They measure visual
+// artifact quality, which gets wired into this file next.
 
-// Local secrets (OPENAI_API_KEY) live in .dev.vars, same file wrangler uses.
+// Load OPENAI_API_KEY / TAVILY_API_KEY from the same dotenv file the worker
+// uses locally, since this script runs outside the Cloudflare runtime.
 config({ path: ".dev.vars" });
 
 const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Golden dataset: hand-written prompts + expected characteristics, checked
-// into evals/datasets/golden.json and grown over time as we find gaps.
+// Golden dataset: each entry is a prompt plus an expected outcome the
+// scorers grade the agent's actual output against.
 const testCases: GoldenTestCase[] = JSON.parse(
-  readFileSync(join("evals", "datasets", "golden.json"), "utf-8")
+  readFileSync(join("evals", "datasets", "golden_2.json"), "utf-8")
 );
 
 Eval<GoldenTestCase, AgentOutput, GoldenTestCase>("Diagram Agent", {
-  // Map each golden case to Braintrust's {input, expected, metadata} shape.
-  // input and expected are the same object here since the scorers need
-  // fields (seed, preservedIds, etc.) that live on the test case itself.
   data: () =>
     testCases.map((tc) => ({
       input: tc,
@@ -49,17 +50,26 @@ Eval<GoldenTestCase, AgentOutput, GoldenTestCase>("Diagram Agent", {
       },
     })),
 
-  // The unit under test: build the fake message history for this case, run
-  // it through the real agent, and hand back only what the scorers need.
   task: async (testCase) => {
     const result = await runAgent({
       model: openai("gpt-5.4-mini"),
       messages: buildMessages(testCase),
-      canvasState: testCase.seed?.elements ?? [],
+      // Eval simulates a browser canvas: the seed elements become the
+      // initial sim state, and queryCanvas is overridden inside runAgent to
+      // read from it. The worker doesn't pass this — it relies on the live
+      // browser via the queryCanvas client tool.
+      seedCanvas: testCase.seed?.elements ?? [],
+      env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
     });
-    return { text: result.text, elements: result.elements };
+    return { text: result.text, elements: result.elements, toolCalls: result.toolCalls };
   },
 
-  // Deterministic, code-based scorers only — no LLM-as-judge here.
-  scores: [schemaScorer, structureScorer, preservationScorer, labelKeywordScorer],
+  // Active scorer set for this run. boundArrows/boundLabels/connectivity are
+  // available in evals/scorers/ but not included here yet.
+  scores: [
+    schemaScorer,
+    structureScorer,
+    toolChoiceScorer,
+    labelKeywordScorer,
+  ],
 });

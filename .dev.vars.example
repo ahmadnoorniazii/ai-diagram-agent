@@ -5,3 +5,7 @@ OPENAI_API_KEY=your-openai-api-key-here
 
 # Free signup at https://www.braintrust.dev — used for the eval dashboard
 BRAINTRUST_API_KEY=your-braintrust-api-key-here
+
+# Free signup at https://tavily.com — 1000 searches/month free tier
+# Used by the searchWeb tool
+TAVILY_API_KEY=your-tavily-api-key-here
