@@ -1,10 +1,11 @@
-// Root component. Wires an Excalidraw canvas to a streaming chat agent: the
-// agent's four canvas tools (queryCanvas/addElements/updateElements/
-// removeElements) execute here, on the client, against the live scene, since
-// the worker has no access to the browser's Excalidraw instance.
+/*
+ * Root app component. Wires the chat agent (Cloudflare Agents SDK, streamed
+ * over a WebSocket-backed connection) to the Excalidraw canvas. The agent's
+ * tool calls (queryCanvas / addElements / updateElements / removeElements)
+ * are executed here on the client, since the canvas only exists in the
+ * browser — the worker never touches Excalidraw state directly.
+ */
 
-// React + Excalidraw imperative API types, plus scene mutation helpers used
-// by the client-side tool handlers below.
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 import {
@@ -17,6 +18,8 @@ import { useAgentChat } from "@cloudflare/ai-chat/react";
 import Canvas from "./components/Canvas";
 import ChatPanel from "./components/chat/ChatPanel";
 import { serializeCanvasState } from "./context/canvas-state";
+import { findOverlaps } from "./context/overlaps";
+import { applyCrossCallBindings, mergeBoundElements } from "./context/cross-call-bindings";
 import "./App.css";
 
 // One agent instance per page load. The canvas state lives only in the
@@ -24,23 +27,31 @@ import "./App.css";
 // conversation referencing diagrams that no longer exist.
 const sessionId = crypto.randomUUID();
 
-// Drop null valued fields. Our tool schemas use nullable rather than
-// optional so OpenAI strict mode stays on, which means the agent always
-// sends every field. Excalidraw expects undefined for "use the default,"
-// not null, and choking on `points: null` for a rectangle is a real bug.
-function stripNulls(obj: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (v !== null) out[k] = v;
+// Recursively drop null valued fields. Our tool schemas use nullable
+// rather than optional so OpenAI strict mode stays on, which means the
+// agent always sends every field. The Excalidraw skeleton helper expects
+// undefined for "use the default," not null, and chokes on `label: null`
+// or `start: null`. Recursion is required because nested objects (label,
+// start, end) also carry nullable fields like fontSize and textAlign.
+function stripNulls(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripNulls);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== null) out[k] = stripNulls(v);
+    }
+    return out;
   }
-  return out;
+  return value;
 }
 
 export default function App() {
-  // excalidrawAPI is null until the Canvas child mounts and hands back its
-  // imperative handle; theme mirrors whatever Excalidraw's own UI is set to.
+  // Excalidraw's imperative handle (scene mutation, scroll, etc.), set once
+  // the Canvas component mounts and the editor initializes.
   const [excalidrawAPI, setExcalidrawAPI] =
     useState<ExcalidrawImperativeAPI | null>(null);
+  // Tracks the canvas's light/dark theme so the surrounding chrome (chat
+  // panel, app shell) can match it.
   const [theme, setTheme] = useState<"light" | "dark">("light");
 
   // Hold the latest excalidrawAPI in a ref so onToolCall (captured once at
@@ -50,10 +61,14 @@ export default function App() {
     excalidrawAPIRef.current = excalidrawAPI;
   }, [excalidrawAPI]);
 
+  // Passed to Canvas as a mount callback; stable identity via useCallback so
+  // it doesn't cause Canvas to re-render on every App render.
   const handleApiReady = useCallback((api: ExcalidrawImperativeAPI) => {
     setExcalidrawAPI(api);
   }, []);
 
+  // Opens the connection to the "design-agent" Durable Object instance for
+  // this session.
   const agent = useAgent({ agent: "design-agent", name: sessionId });
 
   // All four canvas tools are client side. The worker streams the call here,
@@ -68,6 +83,8 @@ export default function App() {
         return;
       }
 
+      // Read-only tool: let the agent inspect the current scene before
+      // deciding how to modify it.
       if (toolCall.toolName === "queryCanvas") {
         addToolOutput({
           toolCallId: toolCall.toolCallId,
@@ -77,25 +94,59 @@ export default function App() {
       }
 
       if (toolCall.toolName === "addElements") {
-        const { elements } = toolCall.input as { elements: Record<string, unknown>[] };
-        // Strip null fields before handing to convertToExcalidrawElements.
-        // Our nullable schema forces the model to send every field, but
-        // Excalidraw expects undefined (not null) for "use the default."
-        // Null `points`, `startBinding`, `endBinding` will crash the helper.
-        const cleaned = elements.map(stripNulls);
+        const { elements } = toolCall.input as { elements: unknown[] };
+        // Strip null fields recursively before handing to
+        // convertToExcalidrawElements. Our nullable schema forces the model
+        // to send every field, but the skeleton helper expects undefined
+        // (not null) for "use the default" and chokes on `label: null` or
+        // `start: null`.
+        const cleaned = elements.map(stripNulls) as Record<string, unknown>[];
         const newOnes = convertToExcalidrawElements(cleaned as never, { regenerateIds: false });
-        const next = [...api.getSceneElements(), ...newOnes];
+
+        // Patch arrow bindings that reference shapes already on the canvas
+        // (the helper only resolves bindings within its own input batch).
+        // See src/context/cross-call-bindings.ts for the gory details.
+        const existingScene = api.getSceneElements();
+        const { arrowsByTargetId } = applyCrossCallBindings(
+          cleaned,
+          newOnes as unknown as { id: string; startBinding?: unknown; endBinding?: unknown }[],
+          existingScene as unknown as { id: string }[]
+        );
+        const patchedExisting = existingScene.map((el) => {
+          const incoming = arrowsByTargetId.get(el.id);
+          if (!incoming || incoming.length === 0) return el;
+          const merged = mergeBoundElements(
+            el as unknown as { id: string; boundElements?: readonly { id: string; type: string }[] },
+            incoming
+          );
+          return newElementWith(el, { boundElements: merged } as never);
+        });
+
+        const next = [...patchedExisting, ...newOnes];
         api.updateScene({ elements: next, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
         api.scrollToContent(next, { fitToContent: true });
-        addToolOutput({ toolCallId: toolCall.toolCallId, output: { added: newOnes.length } });
+        // Detect overlaps in the post-add scene and surface them in the
+        // tool result so the agent's next reasoning step sees collisions
+        // and can self correct via updateElements. Same finding the
+        // noOverlaps eval scorer would report.
+        const overlaps = findOverlaps(next as unknown[]);
+        addToolOutput({
+          toolCallId: toolCall.toolCallId,
+          output: { added: newOnes.length, overlaps },
+        });
         return;
       }
 
+      // Patch existing elements by id with a partial field diff (e.g.
+      // recoloring, repositioning). newElementWith is Excalidraw's helper
+      // for producing an updated element while bumping its version/seed.
       if (toolCall.toolName === "updateElements") {
         const { updates } = toolCall.input as {
           updates: { id: string; fields: Record<string, unknown> }[];
         };
-        const byId = new Map(updates.map((u) => [u.id, stripNulls(u.fields)]));
+        const byId = new Map(
+          updates.map((u) => [u.id, stripNulls(u.fields) as Record<string, unknown>])
+        );
         const next = api.getSceneElements().map((el) => {
           const fields = byId.get(el.id);
           return fields && Object.keys(fields).length > 0
@@ -107,6 +158,7 @@ export default function App() {
         return;
       }
 
+      // Delete elements by id from the live scene.
       if (toolCall.toolName === "removeElements") {
         const { ids } = toolCall.input as { ids: string[] };
         const remove = new Set(ids);
@@ -118,8 +170,8 @@ export default function App() {
     },
   });
 
-  // Canvas on one side, chat on the other; theme class flows down from
-  // Excalidraw's own theme toggle so the surrounding chrome matches.
+  // Canvas + chat side by side; the viewer link is a hash route to a
+  // separate read-only view used for human grading of golden test outputs.
   return (
     <div className={`app ${theme}`}>
       <div className="canvas-container">

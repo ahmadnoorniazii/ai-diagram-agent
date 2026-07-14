@@ -7,7 +7,16 @@
 // Used by the worker on every request: it pulls the canvas state off the
 // latest user message, runs it through this function, and appends the
 // result to the system prompt.
+//
+// Also reports overlaps at the bottom of the summary so that any time the
+// model reads the canvas it sees the same layout finding the noOverlaps
+// scorer would. Hygiene: read paths and write paths agree.
 
+import { findOverlaps } from "./overlaps";
+
+// Minimal shape we care about reading off canvas elements. We don't know
+// (or need) the full Excalidraw element type here — just enough fields to
+// describe position, labels, and arrow bindings.
 interface ElementLike {
   id?: unknown;
   type?: unknown;
@@ -22,7 +31,9 @@ interface ElementLike {
   containerId?: unknown;
 }
 
-// Renders "at (x, y) WxH" for a listing line, or "" if position is missing.
+// Render an element's position/size as a trailing " at (x, y) WxH" string,
+// or "" if it has no numeric position. Rounded to whole pixels since the
+// model doesn't need sub-pixel precision.
 function fmtPos(el: ElementLike): string {
   const x = typeof el.x === "number" ? Math.round(el.x) : null;
   const y = typeof el.y === "number" ? Math.round(el.y) : null;
@@ -33,8 +44,8 @@ function fmtPos(el: ElementLike): string {
   return ` at (${x}, ${y})${size}`;
 }
 
-// Small type-narrowing getters so the rest of the file doesn't repeat these
-// `typeof` guards against the loosely-typed ElementLike shape.
+// Small type-guarded accessors so the rest of the file can assume string
+// ids/types instead of re-checking `typeof` everywhere.
 function getId(el: ElementLike): string | null {
   return typeof el.id === "string" ? el.id : null;
 }
@@ -54,6 +65,9 @@ function getLabel(el: ElementLike): string | null {
   return null;
 }
 
+// Build the plain-text canvas summary appended to the system prompt. Lists
+// every element (grouped/counted by type) plus arrow connections resolved
+// to readable labels, and appends any detected overlaps at the end.
 export function serializeCanvasState(elements: unknown[]): string {
   if (!Array.isArray(elements) || elements.length === 0) {
     return "Canvas is empty.";
@@ -83,6 +97,9 @@ export function serializeCanvasState(elements: unknown[]): string {
     }
   }
 
+  // Main pass: emit one line per element (skipping bound container-text
+  // already folded into its parent's label above), and tally counts by type
+  // for the summary header.
   const lines: string[] = [];
   const counts: Record<string, number> = {};
 
@@ -93,8 +110,6 @@ export function serializeCanvasState(elements: unknown[]): string {
     if (consumedTextIds.has(id)) continue;
     counts[type] = (counts[type] ?? 0) + 1;
 
-    // Connectors are described by their resolved endpoint labels rather
-    // than raw ids, so the model can reason about "User -> API" directly.
     if (type === "arrow" || type === "line") {
       const fromId =
         typeof el.startBinding?.elementId === "string"
@@ -118,5 +133,13 @@ export function serializeCanvasState(elements: unknown[]): string {
     .map(([type, n]) => `${n} ${type}${n === 1 ? "" : "s"}`)
     .join(", ");
 
-  return `Canvas contains ${summary}:\n${lines.join("\n")}`;
+  const overlaps = findOverlaps(elements);
+  const overlapLines =
+    overlaps.length > 0
+      ? `\n\nOverlapping elements (these collide on the canvas, fix them):\n${overlaps
+          .map(([a, b]) => `- ${a} ↔ ${b}`)
+          .join("\n")}`
+      : "";
+
+  return `Canvas contains ${summary}:\n${lines.join("\n")}${overlapLines}`;
 }
