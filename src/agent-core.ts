@@ -17,10 +17,11 @@ import { serializeCanvasState } from "./context/canvas-state";
 import { applySkeleton } from "./context/applySkeleton";
 import { findOverlaps } from "./context/overlaps";
 
-// The single source of truth for agent behavior: role, tool descriptions,
-// hard layout rules, the coordinate grid, diagram-pattern recipes, and
-// worked examples. Both streamAgent (production) and runAgent (eval) use
-// this by default so prompt changes apply everywhere at once.
+// The full system prompt: role, tool descriptions, hard layout rules, the
+// coordinate grid the model is expected to follow mechanically, per-diagram-
+// type layout guidance, negative prompts (things models tend to get wrong),
+// and a couple of worked examples. This is deliberately long and prescriptive
+// because coordinate/layout reasoning is where weaker models drift most.
 export const SYSTEM_PROMPT = `# Role
 
 You are a technical diagram design assistant that controls an Excalidraw canvas. Your niche is technical diagrams: architecture, sequence, flowchart, state machine, ER. You translate the user's request into precise tool calls that produce a working diagram. You are not a chat bot. You are a tool using agent.
@@ -32,6 +33,7 @@ You are a technical diagram design assistant that controls an Excalidraw canvas.
 - **updateElements(updates)** change properties of existing elements by id. Use for recoloring, repositioning, relabeling, resizing.
 - **removeElements(ids)** delete elements by id.
 - **searchWeb(query)** search the web for current information. Use when the user asks about recent technology, frameworks, or systems where you may not have up to date knowledge. Search first, then draw.
+- **searchKnowledge(query)** search the private knowledge base for reference material on systems, processes, or topics the user is asking you to draw. Use this BEFORE drawing when the request touches a specific technical system, protocol, organizational structure, or process where precise details matter. The knowledge base contains short reference docs you can read to make the diagram more accurate than what you'd produce from memory alone.
 
 # Hard rules
 
@@ -107,7 +109,8 @@ Three labeled boxes, two bound arrows. The label is a property of the shape, not
 
 **Additive**: User: "add a Cache box between the API and the Database." Call \`queryCanvas({})\`, then \`addElements\` with \`rect_cache\` (label.text="Cache") plus arrows from \`rect_api\` to \`rect_cache\` and from \`rect_cache\` to \`rect_db\`, each with start and end set. Do not redraw \`rect_api\` or \`rect_db\`.`;
 
-// Shared params for both agent entry points below.
+// Shared input shape for both the streaming (worker) and non-streaming
+// (eval) entry points below.
 interface AgentArgs {
   model: LanguageModel;
   messages: ModelMessage[];
@@ -119,7 +122,11 @@ interface AgentArgs {
   seedCanvas?: unknown[];
   system?: string;
   maxSteps?: number;
-  env?: { TAVILY_API_KEY?: string };
+  env?: {
+    TAVILY_API_KEY?: string;
+    UPSTASH_VECTOR_REST_URL?: string;
+    UPSTASH_VECTOR_REST_TOKEN?: string;
+  };
 }
 
 // Streaming variant. Used by the worker for the live chat experience.
@@ -183,9 +190,6 @@ export async function runAgent({
         return { added: runtime.length, overlaps };
       },
     }),
-    // Same null-stripping the worker does in App.tsx before applying
-    // partial field updates, mirrored here so eval-side updates behave
-    // identically to the live app.
     updateElements: tool({
       description: baseTools.updateElements.description,
       inputSchema: baseTools.updateElements.inputSchema as never,
@@ -204,7 +208,6 @@ export async function runAgent({
         return { updates: cleaned };
       },
     }),
-    // Delete-by-id against the simulated canvas.
     removeElements: tool({
       description: baseTools.removeElements.description,
       inputSchema: baseTools.removeElements.inputSchema as never,
@@ -216,20 +219,15 @@ export async function runAgent({
         return { ids };
       },
     }),
-    // Read-only: reports the current simulated scene back to the model,
-    // same serializer the worker uses for the live canvas.
     queryCanvas: tool({
       description: baseTools.queryCanvas.description,
       inputSchema: z.object({}),
       execute: async () => ({ summary: serializeCanvasState(sim) }),
     }),
-    // No canvas dependency, so the production tool definition (with its
-    // real execute implementation) is reused as-is.
     searchWeb: baseTools.searchWeb,
+    searchKnowledge: baseTools.searchKnowledge,
   };
 
-  // Batch (non-streaming) run: drives the tool loop to completion and
-  // returns the full result, including every step's tool calls.
   const result = await generateText({
     model,
     system,
@@ -245,9 +243,6 @@ export async function runAgent({
     for (const call of step.toolCalls ?? []) toolCalls.push(call.toolName);
   }
 
-  // Final simulated canvas (`elements`) is what scorers grade against; raw
-  // `steps` is kept for scorers that need step-by-step tool call detail
-  // beyond the flattened `toolCalls` list.
   return {
     text: result.text,
     elements: sim,
